@@ -1,0 +1,813 @@
+# @title 📊 Financial Analyst AI with Groq (Lightning Fast + Free!)
+# @markdown Uses Groq's free API - fastest AI inference available, no GPU needed!
+# ============================================================================
+# 🔑 PASTE YOUR GROQ API KEY HERE
+# Get one free at: https://console.groq.com/keys
+# ============================================================================
+GROQ_API_KEY = "INSERT HERE"  # <-- PASTE YOUR API KEY HERE
+# ============================================================================
+# Note: If running in Colab, you may need to install beautifulsoup4:
+# !pip install beautifulsoup4
+import yfinance as yf
+from IPython.display import display, Markdown
+import requests
+import json
+from datetime import datetime
+# ============================================================================
+# SECTION 1: SEC EDGAR DATA FETCHER
+# ============================================================================
+class SECEdgarFetcher:
+    """Fetches company filings from SEC EDGAR database"""
+    
+    def __init__(self, user_agent="Stock Analyzer research@example.com"):
+        self.headers = {'User-Agent': user_agent}
+        self.base_url = "https://data.sec.gov"
+    
+    def get_cik(self, ticker):
+        """Convert ticker to CIK"""
+        try:
+            url = "https://www.sec.gov/files/company_tickers.json"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                ticker_upper = ticker.upper()
+                
+                for entry in data.values():
+                    if entry['ticker'] == ticker_upper:
+                        return str(entry['cik_str']).zfill(10)
+            return None
+        except:
+            return None
+    
+    def get_recent_filings(self, ticker, filing_types=['10-K', '10-Q'], limit=10):
+        """Get recent SEC filings with metadata"""
+        cik = self.get_cik(ticker)
+        if not cik:
+            return None
+        
+        try:
+            url = f"{self.base_url}/submissions/CIK{cik}.json"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            filings = data.get('filings', {}).get('recent', {})
+            
+            results = []
+            forms = filings.get('form', [])
+            filing_dates = filings.get('filingDate', [])
+            accession_numbers = filings.get('accessionNumber', [])
+            primary_docs = filings.get('primaryDocument', [])
+            
+            for i, form in enumerate(forms):
+                if form in filing_types and len(results) < limit:
+                    accession = accession_numbers[i]
+                    results.append({
+                        'type': form,
+                        'date': filing_dates[i],
+                        'accession': accession,
+                        'primary_doc': primary_docs[i] if i < len(primary_docs) else None,
+                        'cik': cik,
+                        'url': f"https://www.sec.gov/cgi-bin/viewer?action=view&cik={cik}&accession_number={accession.replace('-', '')}&xbrl_type=v"
+                    })
+            
+            return results
+        except:
+            return None
+    
+    def get_filing_text(self, filing):
+        """Fetch actual text content from a filing"""
+        try:
+            if not filing.get('primary_doc'):
+                return None
+            
+            # Construct URL to the actual filing document
+            accession = filing['accession'].replace('-', '')
+            cik = filing['cik']
+            doc = filing['primary_doc']
+            
+            # Try to get the text version
+            url = f"https://www.sec.gov/cgi-bin/viewer?action=view&cik={cik}&accession_number={accession}&xbrl_type=v&count=40"
+            
+            response = requests.get(url, headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                return response.text
+            
+            return None
+        except:
+            return None
+    
+    def extract_key_sections(self, filing_text, filing_type='10-K', max_chars=25000):
+        """Extract key sections from filing text - improved for both 10-K and 10-Q"""
+        if not filing_text:
+            return None
+        
+        import re
+        from bs4 import BeautifulSoup
+        
+        try:
+            # Parse HTML
+            soup = BeautifulSoup(filing_text, 'html.parser')
+            text = soup.get_text(separator='\n', strip=True)
+            
+            # Remove excessive whitespace
+            text = re.sub(r'\n\s*\n', '\n\n', text)
+            
+            sections = {}
+            
+            # MD&A is the most important section for KPIs
+            # Item 2 in 10-Q, Item 7 in 10-K
+            if filing_type == '10-Q':
+                # Try multiple patterns for 10-Q MD&A
+                mda_patterns = [
+                    r'(?:ITEM\s*2|Item\s*2)[\.\s]*(?:MANAGEMENT|Management).*?(?:DISCUSSION|Discussion).*?(?:ANALYSIS|Analysis)(.*?)(?:ITEM\s*3|Item\s*3|ITEM\s*4|Item\s*4)',
+                    r'(?:PART\s*I.*?)?(?:ITEM\s*2|Item\s*2)[^\n]*(?:MD&A|DISCUSSION)(.*?)(?:ITEM\s*3|Item\s*3)',
+                ]
+            else:
+                # 10-K patterns
+                mda_patterns = [
+                    r'(?:ITEM\s*7|Item\s*7)[\.\s]*(?:MANAGEMENT|Management).*?(?:DISCUSSION|Discussion)(.*?)(?:ITEM\s*7A|Item\s*7A|ITEM\s*8|Item\s*8)',
+                    r'(?:ITEM\s*7|Item\s*7)[^\n]*(?:MD&A|DISCUSSION)(.*?)(?:ITEM\s*8|Item\s*8)',
+                ]
+            
+            # Try to extract MD&A
+            for pattern in mda_patterns:
+                mda_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                if mda_match:
+                    mda_text = mda_match.group(1)[:max_chars]
+                    sections['MD&A'] = mda_text.strip()
+                    break
+            
+            # If MD&A not found with structured approach, try broader search
+            if 'MD&A' not in sections:
+                # Look for common MD&A keywords and extract surrounding text
+                mda_keywords = r'(?:results of operations|financial condition|liquidity|comparable sales|same.?store sales|key performance indicators)'
+                keyword_match = re.search(mda_keywords, text, re.IGNORECASE)
+                if keyword_match:
+                    # Extract a large chunk around this keyword
+                    start_pos = max(0, keyword_match.start() - 500)
+                    end_pos = min(len(text), keyword_match.end() + max_chars)
+                    sections['MD&A'] = text[start_pos:end_pos].strip()
+            
+            # Risk Factors
+            # Item 1A in 10-K, Item 1A in 10-Q (if present)
+            risk_patterns = [
+                r'(?:ITEM\s*1A|Item\s*1A)[\.\s]*(?:RISK|Risk)\s*(?:FACTORS|Factors)(.*?)(?:ITEM\s*1B|Item\s*1B|ITEM\s*2|Item\s*2|ITEM\s*3|Item\s*3)',
+                r'(?:ITEM\s*1A|Item\s*1A)[^\n]*(?:RISK)(.*?)(?:ITEM|Item)\s*[0-9]',
+            ]
+            
+            for pattern in risk_patterns:
+                risk_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                if risk_match:
+                    risk_text = risk_match.group(1)[:max_chars]
+                    sections['Risk Factors'] = risk_text.strip()
+                    break
+            
+            # Business Description (mainly in 10-K)
+            if filing_type == '10-K':
+                business_patterns = [
+                    r'(?:ITEM\s*1|Item\s*1)[\.\s]*(?:BUSINESS|Business)(.*?)(?:ITEM\s*1A|Item\s*1A)',
+                    r'(?:ITEM\s*1|Item\s*1)[^\n]*(?:BUSINESS)(.*?)(?:ITEM|Item)\s*1A',
+                ]
+                
+                for pattern in business_patterns:
+                    business_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                    if business_match:
+                        business_text = business_match.group(1)[:max_chars]
+                        sections['Business Description'] = business_text.strip()
+                        break
+            
+            # Financial Statements section (contains detailed numbers)
+            fin_patterns = [
+                r'(?:CONSOLIDATED\s*STATEMENTS?\s*OF\s*(?:INCOME|OPERATIONS))(.*?)(?:CONSOLIDATED\s*(?:BALANCE\s*SHEET|STATEMENTS?\s*OF))',
+                r'(?:STATEMENTS?\s*OF\s*(?:INCOME|OPERATIONS))(.*?)(?:BALANCE\s*SHEET|STATEMENTS?\s*OF)',
+            ]
+            
+            for pattern in fin_patterns:
+                fin_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                if fin_match:
+                    fin_text = fin_match.group(1)[:15000]
+                    sections['Financial Statements'] = fin_text.strip()
+                    break
+            
+            return sections if sections else None
+            
+        except Exception as e:
+            # Last resort: extract any text mentioning key metrics
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(filing_text, 'html.parser')
+                text = soup.get_text(separator='\n', strip=True)
+                
+                # Look for paragraphs with key financial terms
+                key_terms = r'(?:revenue|sales|earnings|margin|cash flow|comparable sales|same.?store)'
+                matches = re.finditer(key_terms, text, re.IGNORECASE)
+                
+                if matches:
+                    # Get first match and extract surrounding context
+                    first_match = next(matches, None)
+                    if first_match:
+                        start = max(0, first_match.start() - 1000)
+                        end = min(len(text), first_match.end() + 15000)
+                        return {'Key Excerpts': text[start:end]}
+                
+            except:
+                pass
+            
+            return None
+    
+    def get_company_facts(self, ticker):
+        """Get structured financial data from SEC XBRL filings"""
+        cik = self.get_cik(ticker)
+        if not cik:
+            return None
+        
+        try:
+            # SEC Company Facts API provides structured XBRL data
+            url = f"{self.base_url}/api/xbrl/companyfacts/CIK{cik}.json"
+            response = requests.get(url, headers=self.headers, timeout=15)
+            
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            
+            # Extract key financial metrics from US-GAAP taxonomy
+            facts = data.get('facts', {}).get('us-gaap', {})
+            
+            if not facts:
+                return None
+            
+            # Helper to get most recent annual value
+            def get_recent_annual_value(fact_name):
+                if fact_name not in facts:
+                    return None
+                
+                units = facts[fact_name].get('units', {})
+                # Try USD first, then shares
+                for unit_type in ['USD', 'shares', 'pure']:
+                    if unit_type in units:
+                        values = units[unit_type]
+                        # Filter for annual filings (10-K)
+                        annual_values = [v for v in values if v.get('form') == '10-K']
+                        if annual_values:
+                            # Sort by filing date and get most recent
+                            annual_values.sort(key=lambda x: x.get('filed', ''), reverse=True)
+                            return annual_values[0].get('val')
+                return None
+            
+            # Extract key metrics
+            metrics = {}
+            
+            # Revenue metrics
+            metrics['Revenue'] = get_recent_annual_value('Revenues') or get_recent_annual_value('RevenueFromContractWithCustomerExcludingAssessedTax')
+            metrics['CostOfRevenue'] = get_recent_annual_value('CostOfRevenue')
+            metrics['GrossProfit'] = get_recent_annual_value('GrossProfit')
+            metrics['OperatingIncome'] = get_recent_annual_value('OperatingIncomeLoss')
+            metrics['NetIncome'] = get_recent_annual_value('NetIncomeLoss')
+            metrics['EPS'] = get_recent_annual_value('EarningsPerShareBasic')
+            
+            # Balance sheet
+            metrics['TotalAssets'] = get_recent_annual_value('Assets')
+            metrics['TotalLiabilities'] = get_recent_annual_value('Liabilities')
+            metrics['StockholdersEquity'] = get_recent_annual_value('StockholdersEquity')
+            metrics['Cash'] = get_recent_annual_value('CashAndCashEquivalentsAtCarryingValue')
+            metrics['LongTermDebt'] = get_recent_annual_value('LongTermDebt')
+            
+            # Cash flow
+            metrics['OperatingCashFlow'] = get_recent_annual_value('NetCashProvidedByUsedInOperatingActivities')
+            metrics['CapitalExpenditures'] = get_recent_annual_value('PaymentsToAcquirePropertyPlantAndEquipment')
+            metrics['FreeCashFlow'] = get_recent_annual_value('FreeCashFlow')
+            
+            # Filter out None values
+            metrics = {k: v for k, v in metrics.items() if v is not None}
+            
+            if metrics:
+                print(f"   ✅ Extracted {len(metrics)} XBRL financial metrics:")
+                for k, v in metrics.items():
+                    # Format for display
+                    val_str = f"${v/1e9:.2f}B" if abs(v) >= 1e9 else f"${v/1e6:.2f}M"
+                    print(f"      - {k}: {val_str}")
+            
+            return metrics if metrics else None
+            
+        except Exception as e:
+            return None
+# ============================================================================
+# SECTION 2: DATA FORMATTING
+# ============================================================================
+def format_currency(num):
+    if num is None or num == 'N/A':
+        return "N/A"
+    try:
+        val = float(num)
+        if val >= 1e12:
+            return f"${val/1e12:.2f}T"
+        elif val >= 1e9:
+            return f"${val/1e9:.2f}B"
+        elif val >= 1e6:
+            return f"${val/1e6:.2f}M"
+        elif val >= 1e3:
+            return f"${val/1e3:.2f}K"
+        else:
+            return f"${val:.2f}"
+    except:
+        return str(num)
+def format_percent(num):
+    if num is None or num == 'N/A':
+        return "N/A"
+    try:
+        return f"{float(num)*100:.2f}%"
+    except:
+        return str(num)
+def format_number(num):
+    if num is None or num == 'N/A':
+        return "N/A"
+    try:
+        return f"{float(num):,.0f}"
+    except:
+        return str(num)
+# ============================================================================
+# SECTION 3: DATA FETCHER
+# ============================================================================
+def get_financial_news(ticker, limit=5):
+    """Fetch recent financial news from Google News RSS"""
+    print(f"\n4️⃣  Fetching recent news for {ticker}...")
+    try:
+        # Google News RSS URL
+        url = f"https://news.google.com/rss/search?q={ticker}+stock+finance+when:7d&hl=en-US&gl=US&ceid=US:en"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(response.content)
+            
+            news_items = []
+            for item in root.findall('.//item')[:limit]:
+                title = item.find('title').text
+                pubDate = item.find('pubDate').text
+                source = item.find('source').text if item.find('source') is not None else "Unknown"
+                
+                news_items.append(f"- {title} ({source}, {pubDate})")
+            
+            if news_items:
+                print(f"   ✅ Found {len(news_items)} recent news stories")
+                return "\n\n=== RECENT FINANCIAL NEWS (Last 7 Days) ===\n" + "\n".join(news_items) + "\n"
+            else:
+                print("   ⚠️  No recent news found")
+                return "\n\n=== RECENT FINANCIAL NEWS ===\nNo recent news found.\n"
+        else:
+            print(f"   ⚠️  News fetch failed: {response.status_code}")
+            return ""
+    except Exception as e:
+        print(f"   ⚠️  News fetch error: {e}")
+        return ""
+def get_comprehensive_data(ticker_symbol):
+    """Fetch data from yfinance and SEC EDGAR"""
+    print(f"\n{'='*60}")
+    print(f"📊 Fetching data for {ticker_symbol}...")
+    print(f"{'='*60}\n")
+    
+    # Yahoo Finance Data
+    print("1️⃣  Fetching Yahoo Finance data...")
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        info = stock.info
+        
+        if 'currentPrice' not in info and 'regularMarketPrice' not in info:
+            return None, "❌ Ticker not found."
+        
+        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        
+        # --- FIX DEBT/EQUITY RATIO ---
+        # Yahoo Finance often reports D/E as a percentage (e.g., 237.8 for 2.378x)
+        # We calculate it manually to be safe, or normalize the reported value.
+        total_debt = info.get('totalDebt', 0) or 0
+        stockholders_equity = info.get('stockholdersEquity', 0) or 0
+        reported_de = info.get('debtToEquity')
+        
+        de_ratio_str = "N/A"
+        
+        if total_debt > 0 and stockholders_equity > 0:
+            # Calculate from raw numbers (most reliable)
+            calc_ratio = total_debt / stockholders_equity
+            de_ratio_str = f"{calc_ratio:.2f}x"
+        elif reported_de is not None:
+            # Fallback to reported, but normalize if > 10 (assume it's %)
+            if reported_de > 10:
+                de_ratio_str = f"{reported_de/100:.2f}x"
+            else:
+                de_ratio_str = f"{reported_de:.2f}x"
+        
+        profile = f"""
+COMPANY: {info.get('longName', 'N/A')} ({ticker_symbol.upper()})
+SECTOR: {info.get('sector', 'N/A')}
+INDUSTRY: {info.get('industry', 'N/A')}
+COUNTRY: {info.get('country', 'N/A')}
+EMPLOYEES: {format_number(info.get('fullTimeEmployees'))}
+BUSINESS SUMMARY:
+{info.get('longBusinessSummary', 'N/A')[:1500]}
+VALUATION & SIZE:
+Current Price: {format_currency(current_price)}
+Market Cap: {format_currency(info.get('marketCap'))}
+Enterprise Value: {format_currency(info.get('enterpriseValue'))}
+FINANCIAL PERFORMANCE:
+Total Revenue (TTM): {format_currency(info.get('totalRevenue'))}
+Revenue Growth: {format_percent(info.get('revenueGrowth'))}
+Gross Profit: {format_currency(info.get('grossProfits'))}
+EBITDA: {format_currency(info.get('ebitda'))}
+Net Income: {format_currency(info.get('netIncomeToCommon'))}
+MARGINS:
+Gross Margin: {format_percent(info.get('grossMargins'))}
+Operating Margin: {format_percent(info.get('operatingMargins'))}
+Profit Margin: {format_percent(info.get('profitMargins'))}
+VALUATION RATIOS:
+P/E (Trailing): {info.get('trailingPE', 'N/A')}
+P/E (Forward): {info.get('forwardPE', 'N/A')}
+PEG Ratio: {info.get('pegRatio', 'N/A')}
+Price/Sales: {info.get('priceToSalesTrailing12Months', 'N/A')}
+Price/Book: {info.get('priceToBook', 'N/A')}
+EV/EBITDA: {info.get('enterpriseToEbitda', 'N/A')}
+RETURNS:
+ROE: {format_percent(info.get('returnOnEquity'))}
+ROA: {format_percent(info.get('returnOnAssets'))}
+BALANCE SHEET:
+Total Cash: {format_currency(info.get('totalCash'))}
+Total Debt: {format_currency(info.get('totalDebt'))}
+Net Debt: {format_currency((info.get('totalDebt', 0) or 0) - (info.get('totalCash', 0) or 0))}
+Debt/Equity: {de_ratio_str}
+Current Ratio: {info.get('currentRatio', 'N/A')}
+CASH FLOW:
+Operating Cash Flow: {format_currency(info.get('operatingCashflow'))}
+Free Cash Flow: {format_currency(info.get('freeCashflow'))}
+FCF Yield: {format_percent((info.get('freeCashflow', 0) or 0) / (info.get('marketCap', 1) or 1))}
+DIVIDENDS:
+Dividend Yield: {format_percent(info.get('dividendYield'))}
+Payout Ratio: {format_percent(info.get('payoutRatio'))}
+ANALYST COVERAGE:
+Recommendation: {info.get('recommendationKey', 'N/A').upper()}
+Target Price: {format_currency(info.get('targetMeanPrice'))}
+Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
+"""
+        
+        # Add financial statements
+        statements = ""
+        try:
+            inc = stock.financials
+            if inc is not None and not inc.empty:
+                statements += "\n=== INCOME STATEMENT (Recent Years) ===\n"
+                for idx in inc.index[:10]:
+                    row = inc.loc[idx].iloc[:2]
+                    statements += f"{idx}: {', '.join([format_currency(v) for v in row])}\n"
+        except:
+            pass
+        
+        try:
+            bal = stock.balance_sheet
+            if bal is not None and not bal.empty:
+                statements += "\n=== BALANCE SHEET (Recent Years) ===\n"
+                for idx in bal.index[:10]:
+                    row = bal.loc[idx].iloc[:2]
+                    statements += f"{idx}: {', '.join([format_currency(v) for v in row])}\n"
+        except:
+            pass
+        
+        context = profile + statements
+        print("   ✅ Yahoo Finance data retrieved")
+        
+    except Exception as e:
+        return None, f"❌ Error: {e}"
+    
+    # Data validation and cross-checking
+    data_quality_notes = "\n\n=== DATA QUALITY NOTES ===\n"
+    
+    # Calculate debt-to-equity from raw numbers if available
+    # (Already handled in profile creation, but keeping raw check for debug)
+    if total_debt > 0 and stockholders_equity > 0:
+        calculated_de_ratio = total_debt / stockholders_equity
+        data_quality_notes += f"\nDebt-to-Equity Ratio (Calculated): {calculated_de_ratio:.2f}x\n"
+        data_quality_notes += f"(derived from Total Debt {format_currency(total_debt)} / Equity {format_currency(stockholders_equity)})\n"
+    
+    # Check for unrealistic dividend yield
+    div_yield = info.get('dividendYield', 0) or 0
+    if div_yield > 0.20:  # More than 20% is suspicious
+        data_quality_notes += f"⚠️  DIVIDEND YIELD ANOMALY: {div_yield*100:.1f}% seems unrealistic. Verify this number.\n\n"
+    
+    context += data_quality_notes
+    
+    # SEC EDGAR Data
+    print("\n2️⃣  Fetching SEC EDGAR filings...")
+    try:
+        sec = SECEdgarFetcher()
+        # Fetch more filings to find previous 10-Ks
+        all_filings = sec.get_recent_filings(ticker_symbol, limit=20)
+        
+        # Filter for 10-Ks
+        ten_ks = [f for f in all_filings if f['type'] == '10-K'] if all_filings else []
+        
+        if ten_ks:
+            edgar = "\n\n=== SEC EDGAR FILING ANALYSIS ===\n"
+            
+            # --- CURRENT 10-K ---
+            latest_filing = ten_ks[0]
+            edgar += f"\n--- CURRENT 10-K (Filed: {latest_filing['date']}) ---\n"
+            edgar += f"View at: {latest_filing['url']}\n\n"
+            
+            print(f"   📄 Downloading Current 10-K ({latest_filing['date']})...")
+            filing_text = sec.get_filing_text(latest_filing)
+            
+            if filing_text:
+                print("   📝 Extracting sections from Current 10-K...")
+                sections = sec.extract_key_sections(filing_text, filing_type='10-K', max_chars=25000)
+                
+                if sections:
+                    print(f"      ✅ Extracted {len(sections)} sections")
+                    
+                    if 'Business Description' in sections:
+                        edgar += f"--- BUSINESS DESCRIPTION (Current) ---\n{sections['Business Description']}\n\n"
+                    if 'Risk Factors' in sections:
+                        edgar += f"--- RISK FACTORS (Current) ---\n{sections['Risk Factors']}\n\n"
+                    if 'MD&A' in sections:
+                        edgar += f"--- MD&A (Current) ---\n{sections['MD&A']}\n\n"
+                    if 'Financial Statements' in sections:
+                        edgar += f"--- FINANCIAL STATEMENTS (Current) ---\n{sections['Financial Statements']}\n\n"
+                else:
+                    edgar += "(Could not extract sections from Current 10-K)\n"
+            
+            # --- PREVIOUS 10-K (For Comparison) ---
+            if len(ten_ks) > 1:
+                prev_filing = ten_ks[1]
+                print(f"   📄 Downloading Previous 10-K ({prev_filing['date']}) for comparison...")
+                prev_text = sec.get_filing_text(prev_filing)
+                
+                if prev_text:
+                    print("   📝 Extracting sections from Previous 10-K...")
+                    # Use slightly smaller limit for previous year to save tokens
+                    prev_sections = sec.extract_key_sections(prev_text, filing_type='10-K', max_chars=15000)
+                    
+                    if prev_sections:
+                        print(f"      ✅ Extracted {len(prev_sections)} sections from Previous 10-K")
+                        edgar += f"\n\n=== PREVIOUS YEAR 10-K (Filed: {prev_filing['date']}) ===\n"
+                        edgar += "Use this data ONLY for the 'Year-over-Year Analysis' section.\n\n"
+                        
+                        if 'Risk Factors' in prev_sections:
+                            edgar += f"--- RISK FACTORS (Previous Year) ---\n{prev_sections['Risk Factors']}\n\n"
+                        if 'MD&A' in prev_sections:
+                            edgar += f"--- MD&A (Previous Year) ---\n{prev_sections['MD&A']}\n\n"
+            else:
+                print("   ℹ️  No previous 10-K found for comparison")
+            # --- LATEST 10-Q (For Narrative/Recent Updates) ---
+            ten_qs = [f for f in all_filings if f['type'] == '10-Q'] if all_filings else []
+            if ten_qs:
+                latest_10q = ten_qs[0]
+                # Only fetch if it's newer than the 10-K we just fetched (or if we want recent color regardless)
+                # Usually 10-Q is newer or same era. Let's just fetch it for narrative.
+                print(f"   📄 Downloading Latest 10-Q ({latest_10q['date']}) for narrative...")
+                q_text = sec.get_filing_text(latest_10q)
+                if q_text:
+                    print("   📝 Extracting MD&A from 10-Q...")
+                    q_sections = sec.extract_key_sections(q_text, filing_type='10-Q', max_chars=15000)
+                    if q_sections and 'MD&A' in q_sections:
+                        print(f"      ✅ Extracted 10-Q MD&A ({len(q_sections['MD&A']):,} chars)")
+                        edgar += f"\n\n=== LATEST 10-Q NARRATIVE (Filed: {latest_10q['date']}) ===\n"
+                        edgar += "Use this for recent updates/narrative only (not for core financial data).\n"
+                        edgar += f"--- MD&A (10-Q) ---\n{q_sections['MD&A']}\n\n"
+            context += edgar
+        else:
+            print("   ⚠️  No 10-K filings found")
+    except Exception as e:
+        print(f"   ⚠️  SEC EDGAR error: {e}")
+        pass
+    
+    # SEC Financial Facts (XBRL data)
+    print("\n3️⃣  Fetching SEC EDGAR financial data (XBRL)...")
+    try:
+        sec = SECEdgarFetcher()
+        financial_facts = sec.get_company_facts(ticker_symbol)
+        
+        if financial_facts:
+            edgar_financials = "\n\n=== SEC EDGAR FINANCIAL DATA (from 10-K filings) ===\n"
+            edgar_financials += "These are the official numbers from SEC filings:\n\n"
+            
+            # Format the financial data
+            for metric, value in financial_facts.items():
+                edgar_financials += f"{metric}: {format_currency(value)}\n"
+            
+            context += edgar_financials
+            print(f"   ✅ Retrieved {len(financial_facts)} financial metrics from SEC XBRL data")
+        else:
+            print("   ⚠️  SEC financial data not available")
+    except Exception as e:
+        print(f"   ⚠️  SEC financial data error: {e}")
+        pass
+    # Recent News
+    news_context = get_financial_news(ticker_symbol)
+    context += news_context
+    
+    print(f"\n✅ Data collection complete!\n")
+    return context, None
+# ============================================================================
+# SECTION 4: FRAMEWORK
+# ============================================================================
+FRAMEWORK = """
+Analyze this company using the 13-point framework below.
+**CRITICAL RULES**:
+1. Use ONLY the factual data provided above
+2. Read numbers EXACTLY as written (if it says "200B", write "200B")
+3. Be analytical, precise, and concrete - no marketing language
+4. If data is missing, state "Data not available"
+5. **FORMATTING**: Do NOT use LaTeX math formatting (no $ signs). Use 'USD' suffix for currency (e.g., "500M USD").
+**OUTPUT FORMAT** (use proper markdown):
+## Executive Summary
+Write 150-200 words summarizing how this company makes money, its economic quality, edge, and risks.
+End with one sentence describing the business to an investor.
+## 1. What They Sell and Who Buys
+Describe the main products/services and target customers by type, segment, and geography.
+## 2. How They Make Money
+Explain revenue model, pricing logic, and whether revenues are recurring/one-time/hybrid.
+Include key revenue segments if available. (Format: Plain text, no LaTeX/$)
+## 3. Revenue Quality
+Assess predictability and diversification. Break down recurring vs one-off, customer concentration, and cycle exposure.
+## 4. Cost Structure
+Analyze the specific cost components.
+REQUIRED: Cite the exact % of revenue for:
+- Cost of Revenue (COGS)
+- R&D Expenses
+- SG&A Expenses
+If exact numbers are in the data, use them. Do not say "significant costs" - say "R&D was 1.2B USD (15% of rev)".
+(Format: Plain text, no LaTeX/$)
+## 5. Capital Intensity
+Describe assets needed to run and grow. Include capex levels, working capital needs, and cash conversion efficiency.
+(Format: Plain text, no LaTeX/$)
+## 6. Growth Drivers
+Identify main revenue growth levers (volume, pricing, product mix, geographic expansion, acquisitions).
+Clarify whether each is structural/long-term or cyclical/short-term.
+## 7. Competitive Edge
+Explain what protects economics from competition (brand, cost advantage, switching costs, regulation, network effects, IP).
+Discuss moat durability using financial evidence (margins, ROIC, retention).
+## 8. Industry Structure and Position
+Describe industry value chain and where profit pools sit.
+Explain market structure (fragmented/consolidated, pricing power, regulation).
+Place company within this context (market share, scale, price setter/taker).
+## 9. Unit Economics and Key KPIs
+Present unit economics at relevant level (per customer, store, device, transaction).
+Include metrics like CAC, LTV, churn, ARPU, payback periods where applicable.
+(Format: Plain text, no LaTeX/$)
+## 10. Capital Allocation and Balance Sheet
+Summarize historical capital allocation (organic investment, acquisitions, buybacks, dividends, debt reduction).
+Describe balance sheet strength (leverage, debt maturity, liquidity).
+Assess whether capital allocation has created or destroyed value.
+(Format: Plain text, no LaTeX/$)
+## 11. Risks and Failure Modes
+Identify key risks (competitive, technological, regulatory, macro, customer concentration, currency).
+Incorporate any negative sentiment from "RECENT FINANCIAL NEWS" and specific risks from the **LATEST 10-Q NARRATIVE**.
+Describe how the equity story could fail and what would need to happen.
+## 12. Valuation and Expected Return Profile
+Compare current valuation with history and peers (P/E, EV/EBIT, EV/Sales, FCF yield).
+Provide bear/base/bull scenario framework with rough assumptions and implied upside/downside.
+State what must be true for current price to be attractive, fair, or expensive.
+(Format: Plain text, no LaTeX/$)
+## 13. Catalysts and Time Horizon
+**IMPORTANT**: Do NOT use generic language like "product launches" or "margin inflection" without specifics.
+List SPECIFIC, CONCRETE catalysts with details:
+- Near-term (0-12 months): Mention specific products, earnings dates, contract renewals. Check "RECENT FINANCIAL NEWS" and **LATEST 10-Q** for immediate catalysts.
+- Medium-term (1-3 years): Cite specific strategic initiatives, market expansions, or structural changes mentioned in filings.
+- If no specific catalysts are mentioned in the data, state: "No specific near-term catalysts identified in available data."
+(Format: Plain text, no LaTeX/$)
+**Bad example**: "Near-term catalysts include product launches and margin inflection."
+**Good example**: "Near-term catalysts include the Q4 2024 launch of the new AI platform mentioned in the 10-Q, and potential margin expansion from the cost reduction program targeting $500M in savings by FY2025."
+## 14. Year-over-Year 10-K Analysis (New!)
+Compare the Current 10-K vs the Previous Year's 10-K.
+**STRICT RULES**:
+1. **Financials**: Cite EXACTLY ONE key financial metric change (e.g., "Revenue +15%"). Do NOT list multiple numbers.
+2. **Qualitative Focus**: Identify 2 specific *textual* changes. Did a new Risk Factor appear? Did the MD&A opening statement change?
+3. **Tone**: Be analytical. Example: "The 2024 filing shifts focus from supply chain constraints to AI infrastructure demand."
+If previous 10-K data is not available, state "Previous year comparison data not available."
+"""
+# ============================================================================
+# SECTION 5: GROQ API INTEGRATION
+# ============================================================================
+def analyze_with_groq(context, ticker, api_key):
+    """Use Groq API for ultra-fast analysis"""
+    
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    prompt = f"""You are a Senior Financial Analyst. Analyze {ticker} using the data below.
+DATA:
+{context}
+{FRAMEWORK}
+CRITICAL ANALYSIS REQUIREMENTS:
+1. **CHECK DATA QUALITY NOTES FIRST** - If there are discrepancies flagged (e.g., debt/equity), use the CALCULATED/CORRECTED values, not the reported ones
+2. ALWAYS cite specific numbers from the data above - never say "not available" if the number exists in the data
+3. For example, if you see "Debt/Equity: 237.831", you MUST write "debt-to-equity ratio of 237.8" not "debt-to-equity ratio not available"
+4. Use actual figures: "Revenue of $65.4B" not "significant revenue"
+5. Be specific: "ROE of 30.2%" not "strong returns"
+6. If a metric is truly missing from ALL data sources, only then state "data not available"
+7. Cross-reference Yahoo Finance data with SEC EDGAR data when both are present
+8. When discussing capital allocation, cite specific numbers for dividends, buybacks, debt levels
+9. Avoid vague terms like "relatively leveraged" - use the actual debt/equity ratio
+10. For valuation, always cite the specific multiples (P/E, EV/EBITDA, etc.)
+11. Every claim should be backed by a specific number from the data provided
+12. If data quality notes indicate a discrepancy, acknowledge it and use the corrected value
+13. **AVOID GENERIC BOILERPLATE** - Don't say "product launches" without naming specific products, don't say "margin expansion" without citing the actual margin targets or initiatives from the filings
+14. For Section 13 (Catalysts), be EXTREMELY specific or admit when no specific catalysts are mentioned in the data
+"""
+    
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an expert financial analyst. NEGATIVE CONSTRAINT: Do NOT use LaTeX math formatting (e.g., $5.92B). Do NOT use the '$' character at all. ALWAYS use 'USD' suffix (e.g., '5.92B USD'). This is critical for display."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1,  # Lower temperature for more factual output
+        "max_tokens": 4000,
+    }
+    
+    try:
+        print("🤖 Generating AI analysis with Groq (ultra-fast)...")
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        else:
+            return f"❌ Groq API error: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return f"❌ Error: {e}"
+# ============================================================================
+# SECTION 6: MAIN EXECUTION
+# ============================================================================
+def run_analysis():
+    """Main function"""
+    print("="*60)
+    print("📊 FINANCIAL ANALYST AI - GROQ POWERED")
+    print("   Yahoo Finance + SEC EDGAR + Groq AI")
+    print("   ⚡ Lightning fast inference!")
+    print("="*60)
+    
+    # Validate API key
+    if GROQ_API_KEY == "your-api-key-here" or not GROQ_API_KEY:
+        print("\n❌ ERROR: Please paste your Groq API key at the top of the script!")
+        print("   1. Get a free key at: https://console.groq.com/keys")
+        print("   2. Replace 'your-api-key-here' with your actual key")
+        print("   3. Run the script again\n")
+        return
+    
+    print(f"\n✅ API key configured")
+    
+    # Get ticker
+    ticker = input("\n📈 Enter stock ticker: ").upper().strip()
+    if not ticker:
+        print("❌ Ticker required")
+        return
+    
+    # Fetch data
+    context, error = get_comprehensive_data(ticker)
+    if error:
+        print(error)
+        return
+    
+    # Generate analysis
+    print(f"\n{'='*60}")
+    print(f"🔍 Analyzing {ticker}...")
+    print(f"{'='*60}\n")
+    
+    analysis = analyze_with_groq(context, ticker, GROQ_API_KEY)
+    
+    # Display results
+    print("\n" + "="*60)
+    print(f"📊 ANALYSIS COMPLETE: {ticker}")
+    print("="*60 + "\n")
+    
+    display(Markdown(analysis))
+    
+    # Save to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{ticker}_analysis_{timestamp}.md"
+    
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(f"# Stock Analysis: {ticker}\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(analysis)
+    
+    print(f"\n💾 Saved to: {filename}")
+    print("\n✅ Analysis complete!")
+# RUN IT
+if __name__ == "__main__":
+    run_analysis()
