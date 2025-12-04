@@ -685,7 +685,7 @@ Compare the Current 10-K vs the Previous Year's 10-K.
 **STRICT RULES**:
 1. **Financials**: Cite EXACTLY ONE key financial metric change (e.g., "Revenue +15%"). Do NOT list multiple numbers.
 2. **Qualitative Focus**: Identify 2 specific *textual* changes. Did a new Risk Factor appear? Did the MD&A opening statement change?
-3. **Tone**: Be analytical. Example: "The 2024 filing shifts focus from supply chain constraints to AI infrastructure demand."
+3. **Tone**: Be analytical. 
 If previous 10-K data is not available, state "Previous year comparison data not available."
 """
 # ============================================================================
