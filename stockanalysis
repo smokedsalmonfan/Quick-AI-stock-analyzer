@@ -4,10 +4,10 @@
 # 🔑 PASTE YOUR GOOGLE AI STUDIO API KEY HERE
 # Get one free at: https://aistudio.google.com/app/apikey
 # ============================================================================
-GEMINI_API_KEY = "xxxxxx"  # <-- PASTE YOUR API KEY HERE
+GEMINI_API_KEY = "xxxxx"  # <-- PASTE YOUR API KEY HERE
 # ============================================================================
 # Note: If running in Colab, you may need to install beautifulsoup4 and google-generativeai:
-# !pip install beautifulsoup4 google-generativeai
+# !pip install beautifulsoup4 google-generativeai pypdf yfinance python-docx
 import yfinance as yf
 from IPython.display import display, Markdown
 import requests
@@ -15,55 +15,51 @@ import json
 from datetime import datetime
 import google.generativeai as genai
 import time
+# Check if running in Colab
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
 # ============================================================================
 # SECTION 1: SEC EDGAR DATA FETCHER
 # ============================================================================
 class SECEdgarFetcher:
     """Fetches company filings from SEC EDGAR database"""
-
     def __init__(self, user_agent="Stock Analyzer research@example.com"):
         self.headers = {'User-Agent': user_agent}
         self.base_url = "https://data.sec.gov"
-
     def get_cik(self, ticker):
         """Convert ticker to CIK"""
         try:
             url = "https://www.sec.gov/files/company_tickers.json"
             response = requests.get(url, headers=self.headers, timeout=10)
-
             if response.status_code == 200:
                 data = response.json()
                 ticker_upper = ticker.upper()
-
                 for entry in data.values():
                     if entry['ticker'] == ticker_upper:
                         return str(entry['cik_str']).zfill(10)
             return None
         except:
             return None
-
     def get_recent_filings(self, ticker, filing_types=['10-K', '10-Q', 'DEF 14A'], limit=10):
         """Get recent SEC filings with metadata"""
         cik = self.get_cik(ticker)
         if not cik:
             return None
-
         try:
             url = f"{self.base_url}/submissions/CIK{cik}.json"
             response = requests.get(url, headers=self.headers, timeout=10)
-
             if response.status_code != 200:
                 return None
-
             data = response.json()
             filings = data.get('filings', {}).get('recent', {})
-
             results = []
             forms = filings.get('form', [])
             filing_dates = filings.get('filingDate', [])
             accession_numbers = filings.get('accessionNumber', [])
             primary_docs = filings.get('primaryDocument', [])
-
             for i, form in enumerate(forms):
                 if form in filing_types and len(results) < limit:
                     accession = accession_numbers[i]
@@ -76,39 +72,30 @@ class SECEdgarFetcher:
                         'cik': cik,
                         'url': filing_url
                     })
-
             return results
         except:
             return None
-
     def get_filing_text(self, filing):
         """Fetch actual text content from a filing"""
         try:
             if not filing.get('primary_doc'):
                 return None
-
             # Construct URL to the actual filing document (Raw Text)
             # URL format: https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{accession_no_dashes}/{accession}.txt
             accession_no_dashes = filing['accession'].replace('-', '')
             accession = filing['accession']
             cik_int = int(filing['cik']) # Strip zeros
-
             url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_no_dashes}/{accession}.txt"
-
             # Add a specific header to avoid 403s on Archives
             headers = self.headers.copy()
             headers['Host'] = 'www.sec.gov'
-
             print(f"      ⬇️  Downloading from: {url}")
             response = requests.get(url, headers=headers, timeout=20)
-
             if response.status_code == 200:
                 return response.text
-
             return None
         except:
             return None
-
     def extract_key_sections(self, filing_text, filing_type='10-K', max_chars=600000, specific_section=None):
         """
         Extract specific section (like MD&A) or full text.
@@ -117,16 +104,13 @@ class SECEdgarFetcher:
         """
         if not filing_text:
             return None
-
         import re
         from bs4 import BeautifulSoup
-
         try:
             # Parse HTML
             soup = BeautifulSoup(filing_text, 'html.parser')
             text = soup.get_text(separator='\n', strip=True)
             text = re.sub(r'\n\s*\n', '\n\n', text)
-
             # If we want EVERYTHING (Current 10-K)
             if not specific_section:
                 truncated_text = text[:max_chars]
@@ -142,7 +126,6 @@ class SECEdgarFetcher:
                     r'(?:ITEM\s*7|Item\s*7)[\.\ s]*(?:MANAGEMENT|Management).*?(?:DISCUSSION|Discussion)(.*?)(?:ITEM\s*7A|Item\s*7A|ITEM\s*8|Item\s*8)',
                     r'(?:ITEM\s*7|Item\s*7)[^\n]*(?:MD&A|DISCUSSION)(.*?)(?:ITEM\s*8|Item\s*8)',
                 ]
-
                 print("      🔍 Searching for MD&A section...")
                 for pattern in mda_patterns:
                     # Find all matches, not just the first (to skip TOCs)
@@ -155,46 +138,35 @@ class SECEdgarFetcher:
                             return {'FULL_FILING_TEXT': content[:max_chars]}
                         else:
                             print(f"      ℹ️  Skipped potential TOC match ({len(content)} chars)")
-
                 # Fallback: simple text search if regex fails
                 print("      ⚠️  Regex MD&A search failed, using keyword search...")
                 idx = text.lower().find("management's discussion")
                 if idx != -1:
                     return {'FULL_FILING_TEXT': text[idx:idx+max_chars]}
-
                 return {'FULL_FILING_TEXT': text[:max_chars]} # Ultimate fallback
-
             return {'FULL_FILING_TEXT': text[:max_chars]}
         except Exception as e:
             return {'FULL_FILING_TEXT': filing_text[:max_chars]}
-
     def get_company_facts(self, ticker):
         """Get structured financial data from SEC XBRL filings"""
         cik = self.get_cik(ticker)
         if not cik:
             return None
-
         try:
             # SEC Company Facts API provides structured XBRL data
             url = f"{self.base_url}/api/xbrl/companyfacts/CIK{cik}.json"
             response = requests.get(url, headers=self.headers, timeout=15)
-
             if response.status_code != 200:
                 return None
-
             data = response.json()
-
             # Extract key financial metrics from US-GAAP taxonomy
             facts = data.get('facts', {}).get('us-gaap', {})
-
             if not facts:
                 return None
-
             # Helper to get most recent annual value
             def get_recent_annual_value(fact_name):
                 if fact_name not in facts:
                     return None
-
                 units = facts[fact_name].get('units', {})
                 # Try USD first, then shares
                 for unit_type in ['USD', 'shares', 'pure']:
@@ -207,10 +179,8 @@ class SECEdgarFetcher:
                             annual_values.sort(key=lambda x: x.get('filed', ''), reverse=True)
                             return annual_values[0].get('val')
                 return None
-
             # Extract key metrics
             metrics = {}
-
             # Revenue metrics
             metrics['Revenue'] = get_recent_annual_value('Revenues') or get_recent_annual_value('RevenueFromContractWithCustomerExcludingAssessedTax')
             metrics['CostOfRevenue'] = get_recent_annual_value('CostOfRevenue')
@@ -218,35 +188,29 @@ class SECEdgarFetcher:
             metrics['OperatingIncome'] = get_recent_annual_value('OperatingIncomeLoss')
             metrics['NetIncome'] = get_recent_annual_value('NetIncomeLoss')
             metrics['EPS'] = get_recent_annual_value('EarningsPerShareBasic')
-
             # Balance sheet
             metrics['TotalAssets'] = get_recent_annual_value('Assets')
             metrics['TotalLiabilities'] = get_recent_annual_value('Liabilities')
             metrics['StockholdersEquity'] = get_recent_annual_value('StockholdersEquity')
             metrics['Cash'] = get_recent_annual_value('CashAndCashEquivalentsAtCarryingValue')
             metrics['LongTermDebt'] = get_recent_annual_value('LongTermDebt')
-
             # Cash flow
             metrics['OperatingCashFlow'] = get_recent_annual_value('NetCashProvidedByUsedInOperatingActivities')
             metrics['CapitalExpenditures'] = get_recent_annual_value('PaymentsToAcquirePropertyPlantAndEquipment')
             metrics['FreeCashFlow'] = get_recent_annual_value('FreeCashFlow')
-
             # Filter out None values
             metrics = {k: v for k, v in metrics.items() if v is not None}
-
             if metrics:
                 print(f"   ✅ Extracted {len(metrics)} XBRL financial metrics:")
                 for k, v in metrics.items():
                     # Format for display
-                    val_str = f"${v/1e9:.1f}B" if abs(v) >= 1e9 else f"${v/1e6:.1f}M"
+                    val_str = f"${v/1e9:.2f}B" if abs(v) >= 1e9 else f"${v/1e6:.2f}M"
                     print(f"      - {k}: {val_str}")
-
             return metrics if metrics else None
-
         except Exception as e:
             return None
 # ============================================================================
-# SECTION 2: DATA FORMATTING (UPDATED TO 1 DECIMAL PLACE)
+# SECTION 2: DATA FORMATTING
 # ============================================================================
 def format_currency(num):
     if num is None or num == 'N/A':
@@ -254,22 +218,22 @@ def format_currency(num):
     try:
         val = float(num)
         if val >= 1e12:
-            return f"${val/1e12:.1f}T"
+            return f"${val/1e12:.2f}T"
         elif val >= 1e9:
-            return f"${val/1e9:.1f}B"
+            return f"${val/1e9:.2f}B"
         elif val >= 1e6:
-            return f"${val/1e6:.1f}M"
+            return f"${val/1e6:.2f}M"
         elif val >= 1e3:
-            return f"${val/1e3:.1f}K"
+            return f"${val/1e3:.2f}K"
         else:
-            return f"${val:.1f}"
+            return f"${val:.2f}"
     except:
         return str(num)
 def format_percent(num):
     if num is None or num == 'N/A':
         return "N/A"
     try:
-        return f"{float(num)*100:.1f}%"
+        return f"{float(num)*100:.2f}%"
     except:
         return str(num)
 def format_number(num):
@@ -287,38 +251,31 @@ def get_comprehensive_data(ticker_symbol):
     print(f"\n{'='*60}")
     print(f"📊 Fetching data for {ticker_symbol}...")
     print(f"{'='*60}\n")
-
     # Yahoo Finance Data
     print("1️⃣  Fetching Yahoo Finance data...")
     try:
         stock = yf.Ticker(ticker_symbol)
         info = stock.info
-
         if 'currentPrice' not in info and 'regularMarketPrice' not in info:
             return None, "❌ Ticker not found."
-
         current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
-
         # --- FIX DEBT/EQUITY RATIO ---
         # Yahoo Finance often reports D/E as a percentage
         # We calculate it manually to be safe, or normalize the reported value.
         total_debt = info.get('totalDebt', 0) or 0
         stockholders_equity = info.get('stockholdersEquity', 0) or 0
         reported_de = info.get('debtToEquity')
-
         de_ratio_str = "N/A"
-
         if total_debt > 0 and stockholders_equity > 0:
             # Calculate from raw numbers (most reliable)
             calc_ratio = total_debt / stockholders_equity
-            de_ratio_str = f"{calc_ratio:.1f}x"
+            de_ratio_str = f"{calc_ratio:.2f}x"
         elif reported_de is not None:
             # Fallback to reported, but normalize if > 10 (assume it's %)
             if reported_de > 10:
-                de_ratio_str = f"{reported_de/100:.1f}x"
+                de_ratio_str = f"{reported_de/100:.2f}x"
             else:
-                de_ratio_str = f"{reported_de:.1f}x"
-
+                de_ratio_str = f"{reported_de:.2f}x"
         profile = f"""
 COMPANY: {info.get('longName', 'N/A')} ({ticker_symbol.upper()})
 SECTOR: {info.get('sector', 'N/A')}
@@ -342,12 +299,12 @@ Gross Margin: {format_percent(info.get('grossMargins'))}
 Operating Margin: {format_percent(info.get('operatingMargins'))}
 Profit Margin: {format_percent(info.get('profitMargins'))}
 VALUATION RATIOS:
-P/E (Trailing): {info.get('trailingPE', 'N/A') if info.get('trailingPE') == 'N/A' else f"{info.get('trailingPE', 0):.1f}"}
-P/E (Forward): {info.get('forwardPE', 'N/A') if info.get('forwardPE') == 'N/A' else f"{info.get('forwardPE', 0):.1f}"}
-PEG Ratio: {info.get('pegRatio', 'N/A') if info.get('pegRatio') == 'N/A' else f"{info.get('pegRatio', 0):.1f}"}
-Price/Sales: {info.get('priceToSalesTrailing12Months', 'N/A') if info.get('priceToSalesTrailing12Months') == 'N/A' else f"{info.get('priceToSalesTrailing12Months', 0):.1f}"}
-Price/Book: {info.get('priceToBook', 'N/A') if info.get('priceToBook') == 'N/A' else f"{info.get('priceToBook', 0):.1f}"}
-EV/EBITDA: {info.get('enterpriseToEbitda', 'N/A') if info.get('enterpriseToEbitda') == 'N/A' else f"{info.get('enterpriseToEbitda', 0):.1f}"}
+P/E (Trailing): {info.get('trailingPE', 'N/A')}
+P/E (Forward): {info.get('forwardPE', 'N/A')}
+PEG Ratio: {info.get('pegRatio', 'N/A')}
+Price/Sales: {info.get('priceToSalesTrailing12Months', 'N/A')}
+Price/Book: {info.get('priceToBook', 'N/A')}
+EV/EBITDA: {info.get('enterpriseToEbitda', 'N/A')}
 RETURNS:
 ROE: {format_percent(info.get('returnOnEquity'))}
 ROA: {format_percent(info.get('returnOnAssets'))}
@@ -356,7 +313,7 @@ Total Cash: {format_currency(info.get('totalCash'))}
 Total Debt: {format_currency(info.get('totalDebt'))}
 Net Debt: {format_currency((info.get('totalDebt', 0) or 0) - (info.get('totalCash', 0) or 0))}
 Debt/Equity: {de_ratio_str}
-Current Ratio: {info.get('currentRatio', 'N/A') if info.get('currentRatio') == 'N/A' else f"{info.get('currentRatio', 0):.1f}"}
+Current Ratio: {info.get('currentRatio', 'N/A')}
 CASH FLOW:
 Operating Cash Flow: {format_currency(info.get('operatingCashflow'))}
 Free Cash Flow: {format_currency(info.get('freeCashflow'))}
@@ -369,7 +326,6 @@ Recommendation: {info.get('recommendationKey', 'N/A').upper()}
 Target Price: {format_currency(info.get('targetMeanPrice'))}
 Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
 """
-
         # Add financial statements
         statements = ""
         try:
@@ -381,7 +337,6 @@ Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
                     statements += f"{idx}: {', '.join([format_currency(v) for v in row])}\n"
         except:
             pass
-
         try:
             bal = stock.balance_sheet
             if bal is not None and not bal.empty:
@@ -391,42 +346,33 @@ Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
                     statements += f"{idx}: {', '.join([format_currency(v) for v in row])}\n"
         except:
             pass
-
         context = profile + statements
         print("   ✅ Yahoo Finance data retrieved")
-
     except Exception as e:
         return None, f"❌ Error: {e}"
-
     # Data validation and cross-checking
     data_quality_notes = "\n\n=== DATA QUALITY NOTES ===\n"
-
     # Calculate debt-to-equity from raw numbers if available
     # (Already handled in profile creation, but keeping raw check for debug)
     if total_debt > 0 and stockholders_equity > 0:
         calculated_de_ratio = total_debt / stockholders_equity
-        data_quality_notes += f"\nDebt-to-Equity Ratio (Calculated): {calculated_de_ratio:.1f}x\n"
+        data_quality_notes += f"\nDebt-to-Equity Ratio (Calculated): {calculated_de_ratio:.2f}x\n"
         data_quality_notes += f"(derived from Total Debt {format_currency(total_debt)} / Equity {format_currency(stockholders_equity)})\n"
-
     # Check for unrealistic dividend yield
     div_yield = info.get('dividendYield', 0) or 0
     if div_yield > 0.20:  # More than 20% is suspicious
         data_quality_notes += f"⚠️  DIVIDEND YIELD ANOMALY: {div_yield*100:.1f}% seems unrealistic. Verify this number.\n\n"
-
     context += data_quality_notes
-
     # SEC EDGAR Data
     print("\n2️⃣  Fetching SEC EDGAR filings...")
     try:
         sec = SECEdgarFetcher()
         # Fetch more filings to find previous 10-Ks
         all_filings = sec.get_recent_filings(ticker_symbol, limit=20)
-
         # Filter for 10-Ks
         ten_ks = [f for f in all_filings if f['type'] == '10-K'] if all_filings else []
         ten_qs = [f for f in all_filings if f['type'] == '10-Q'] if all_filings else []
         def_14as = [f for f in all_filings if f['type'] == 'DEF 14A'] if all_filings else []
-
         # Print all SEC filing links
         if all_filings:
             print(f"\n   *** SEC FILING LINKS ***")
@@ -434,41 +380,33 @@ Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
                 print(f"      {filing['type']} ({filing['date']})")
                 print(f"      {filing['url']}")
                 print()
-
         if ten_ks:
             edgar = "\n\n=== SEC EDGAR FILING ANALYSIS ===\n"
-
             # --- CURRENT 10-K ---
             latest_filing = ten_ks[0]
             edgar += f"\n--- CURRENT 10-K (Filed: {latest_filing['date']}) ---\n"
             edgar += f"View at: {latest_filing['url']}\n\n"
-
             print(f"   📄 Downloading Current 10-K ({latest_filing['date']})...")
             filing_text = sec.get_filing_text(latest_filing)
-
             if filing_text:
                 print("   📝 Extracting FULL TEXT from Current 10-K (Gemini 1.5 Flash can handle it)...")
                 # Reduced to 500k chars to fit 250k token limit
                 sections = sec.extract_key_sections(filing_text, filing_type='10-K', max_chars=500000)
-
                 if sections:
                     print(f"      ✅ Extracted Full 10-K Text ({len(sections.get('FULL_FILING_TEXT', '')):,} chars)")
                     edgar += f"--- FULL 10-K TEXT (Current) ---\n{sections.get('FULL_FILING_TEXT', '')}\n\n"
                 else:
                     edgar += "(Could not extract sections from Current 10-K)\n"
-
             # --- PREVIOUS 10-K (For Comparison) ---
             # --- PREVIOUS 10-K (For Comparison - MD&A ONLY) ---
             if len(ten_ks) > 1:
                 prev_filing = ten_ks[1]
                 print(f"   📄 Downloading Previous 10-K ({prev_filing['date']}) for comparison...")
                 prev_text = sec.get_filing_text(prev_filing)
-
                 if prev_text:
                     print("   📝 Extracting ONLY MD&A from Previous 10-K (to save tokens)...")
                     # Use tailored MD&A extraction with strict limit
                     prev_sections = sec.extract_key_sections(prev_text, filing_type='10-K', max_chars=100000, specific_section='MD&A')
-
                     if prev_sections:
                         print(f"      ✅ Extracted Previous MD&A ({len(prev_sections.get('FULL_FILING_TEXT','')):,} chars)")
                         edgar += f"\n\n=== PREVIOUS YEAR 10-K (Filed: {prev_filing['date']}) ===\n"
@@ -499,21 +437,17 @@ Number of Analysts: {info.get('numberOfAnalystOpinions', 'N/A')}
     except Exception as e:
         print(f"   ⚠️  SEC EDGAR error: {e}")
         pass
-
     # SEC Financial Facts (XBRL data)
     print("\n3️⃣  Fetching SEC EDGAR financial data (XBRL)...")
     try:
         sec = SECEdgarFetcher()
         financial_facts = sec.get_company_facts(ticker_symbol)
-
         if financial_facts:
             edgar_financials = "\n\n=== SEC EDGAR FINANCIAL DATA (from 10-K filings) ===\n"
             edgar_financials += "These are the official numbers from SEC filings:\n\n"
-
             # Format the financial data
             for metric, value in financial_facts.items():
                 edgar_financials += f"{metric}: {format_currency(value)}\n"
-
             context += edgar_financials
             print(f"   ✅ Retrieved {len(financial_facts)} financial metrics from SEC XBRL data")
         else:
@@ -535,7 +469,6 @@ Analyze this company using the 13-point framework below.
 3. Be analytical, precise, and concrete - no marketing language
 4. If data is missing, state "Data not available"
 5. **FORMATTING**: Do NOT use LaTeX math formatting (no $ signs). Use 'USD' suffix for currency (e.g., "500M USD").
-6. **ALL NUMBERS TO 1 DECIMAL PLACE** (e.g., "80.8%" not "80.81%", "5.5B USD" not "5.48B USD")
 **OUTPUT FORMAT** (use proper markdown):
 ## Executive Summary
 Write 150-200 words summarizing how this company makes money, its economic quality, edge, and risks.
@@ -614,5 +547,179 @@ List SPECIFIC, CONCRETE catalysts with details:
 - **CRITICAL**: If 'Adjusted' metrics are used (e.g., Adjusted EBITDA, Non-GAAP Income), explicitly list WHAT is excluded.
 - If Goodwill/Impairments are excluded, explicitly state: "Incentivized to make acquisitions regardless of subsequent performance."
 - If Stock Based Compensation is excluded, explicitly state: "Incentivized to dilute shareholders."
-- **PROVIDE COMPLETE ANALYSIS** - do not cut off mid-sentence.
 """
+# ============================================================================
+# SECTION 5: GEMINI API INTEGRATION
+# ============================================================================
+def analyze_with_gemini(context, ticker, api_key):
+    """Use Google Gemini 1.5 Flash for massive-context analysis"""
+    try:
+        genai.configure(api_key=api_key)
+        # Generation config
+        generation_config = {
+            "temperature": 0.1,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_output_tokens": 8192,
+            "response_mime_type": "text/plain",
+        }
+        prompt = f"""You are a Senior Financial Analyst. Analyze {ticker} using the data below.
+        DATA:
+        {context}
+        {FRAMEWORK}
+        CRITICAL ANALYSIS REQUIREMENTS:
+        1. **CHECK DATA QUALITY NOTES FIRST** - If there are discrepancies flagged (e.g., debt/equity), use the CALCULATED/CORRECTED values.
+        2. ALWAYS cite specific numbers from the data above.
+        3. If a number is a ratio, use a percentage sign.
+        4. Use actual figures.
+        5. Be specific.
+        6. **CONTEXT USAGE**: You have been provided with the FULL TEXT of the 10-K. Use this to find specific details, unit economics, and deep insights that other AIs might miss.
+        7. Cross-reference Yahoo Finance data with SEC EDGAR data when both are present.
+        8. **AVOID GENERIC BOILERPLATE**.
+        """
+        # Try multiple model names based on user's available models
+        # Prioritize "latest" aliases which often map to stable production models with better quotas
+        model_candidates = [
+            "gemini-flash-latest",    # Production 1.5/2.0 Flash (Stable limits)
+            "gemini-2.5-flash",       # High performance, 250k limit
+            "gemini-2.0-flash",       # Standard 2.0
+            "gemini-pro-latest",      # Production Pro
+        ]
+        last_error = None
+        for model_name in model_candidates:
+            try:
+                print(f"   🤖 Trying model: {model_name}...")
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config=generation_config,
+                    system_instruction="You are an expert financial analyst. NEGATIVE CONSTRAINT: Do NOT use LaTeX math formatting (e.g., $5.92B). Do NOT use the '$' character at all. ALWAYS use 'USD' suffix (e.g., '5.92B USD'). This is critical for display."
+                )
+                # Test connection / create chat
+                chat_session = model.start_chat(history=[])
+                print(f"      Generating analysis with {model_name}...")
+                response = chat_session.send_message(prompt)
+                return response.text
+            except Exception as e:
+                print(f"      ⚠️  {model_name} failed: {e}")
+                if "429" in str(e):
+                    print("      ⏳ Rate limit hit. Waiting 10s before retry...")
+                    time.sleep(10)
+                last_error = e
+                continue
+        return f"❌ All Gemini models failed. Last error: {last_error}"
+    except Exception as e:
+        return f"❌ Gemini API error: {e}"
+# ============================================================================
+# SECTION 6: MAIN EXECUTION
+# ============================================================================
+def save_as_docx(text, filename):
+    """Save analysis as a Word document with basic formatting"""
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        import re
+    except ImportError:
+        print("⚠️  python-docx not installed. Saving as text file instead.")
+        return False
+    try:
+        doc = Document()
+        doc.add_heading(f"Stock Analysis Report", 0)
+        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Simple Markdown parser
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Headings
+            if line.startswith('## '):
+                doc.add_heading(line.replace('## ', ''), level=2)
+            elif line.startswith('# '):
+                doc.add_heading(line.replace('# ', ''), level=1)
+            # Bold lines (simple)
+            elif line.startswith('**') and line.endswith('**'):
+                p = doc.add_paragraph()
+                run = p.add_run(line.replace('**', ''))
+                run.bold = True
+            # List items
+            elif line.startswith('* '):
+                doc.add_paragraph(line.replace('* ', ''), style='List Bullet')
+            elif line.startswith('- '):
+                doc.add_paragraph(line.replace('- ', ''), style='List Bullet')
+            # Standard Text
+            else:
+                p = doc.add_paragraph(line)
+        
+        doc.save(filename)
+        return True
+    except Exception as e:
+        print(f"Error creating DOCX: {e}")
+        return False
+def run_analysis():
+    """Main function"""
+    print("="*60)
+    print("📊 FINANCIAL ANALYST AI - GEMINI POWERED (1M+ CONTEXT)")
+    print("   Yahoo Finance + SEC EDGAR + Gemini 1.5 Flash")
+    print("   ⚡ Massive Context Window Analysis")
+    print("="*60)
+    # Validate API key
+    if GEMINI_API_KEY == "xxxxxx" or not GEMINI_API_KEY:
+        print("\n❌ ERROR: Please paste your Google Gemini API key at the top of the script!")
+        print("   1. Get a free key at: https://aistudio.google.com/app/apikey")
+        print("   2. Replace 'your-api-key-here' with your actual key")
+        print("   3. Run the script again\n")
+        return
+    print(f"\n✅ API key configured")
+    # Get ticker
+    ticker = input("\n📈 Enter stock ticker: ").upper().strip()
+    if not ticker:
+        print("❌ Ticker required")
+        return
+    # Fetch data
+    context, error = get_comprehensive_data(ticker)
+    if error:
+        print(error)
+        return
+    # Generate analysis
+    print(f"\n{'='*60}")
+    print(f"🔍 Analyzing {ticker}...")
+    print(f"{'='*60}\n")
+    analysis = analyze_with_gemini(context, ticker, GEMINI_API_KEY)
+    # Display results
+    print("\n" + "="*60)
+    print(f"📊 ANALYSIS COMPLETE: {ticker}")
+    print("="*60 + "\n")
+    display(Markdown(analysis))
+    # Save to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Try saving as DOCX
+    docx_filename = f"{ticker}_analysis_{timestamp}.docx"
+    print(f"\n💾 Saving to: {docx_filename}...")
+    
+    success = save_as_docx(analysis, docx_filename)
+    
+    if success:
+        print(f"✅ Saved DOCX successfully.")
+        filename = docx_filename
+    else:
+        # Fallback to text file (user can open in Notepad/Word)
+        filename = f"{ticker}_analysis_{timestamp}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"Stock Analysis: {ticker}\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(analysis)
+        print(f"⚠️  Saved as plain text (.txt) because python-docx is missing or failed.")
+    # Trigger download in Colab
+    if IN_COLAB:
+        try:
+            files.download(filename)
+        except Exception as e:
+             print(f"Could not automatically download file: {e}")
+        
+    print(f"\n💾 Saved to: {filename}")
+    print("\n✅ Analysis complete!")
+# RUN IT
+if __name__ == "__main__":
+    run_analysis()
